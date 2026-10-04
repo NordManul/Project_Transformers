@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+checkpoints/
+data/
+*.pt
+*.pt.done

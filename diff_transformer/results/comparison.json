@@ -1,0 +1,137 @@
+[
+  {
+    "name": "transformer",
+    "arch": "baseline",
+    "heads": 6,
+    "d": 64,
+    "gn": false,
+    "lambda_init": null,
+    "step": 3000,
+    "params": 38736768,
+    "loss": {
+      "all": 1.7614889499165887,
+      "hit": 0.9616102578278606,
+      "other": 1.9311178453606967,
+      "hit_share": 0.1749639730999146
+    },
+    "acts": {
+      "attention logits": [
+        21.952392578125,
+        21.85831069946289,
+        21.806875228881836,
+        20.687843322753906,
+        18.638259887695312,
+        1.8194100856781006
+      ],
+      "hidden states": [
+        10.312444686889648,
+        10.311823844909668,
+        10.262346267700195,
+        10.192855834960938,
+        8.677214622497559,
+        0.2880128026008606
+      ]
+    },
+    "gen": {
+      "distinct-1": 0.18537950332284014,
+      "distinct-2": 0.6638388123011665,
+      "distinct-3": 0.8713826366559485,
+      "repeat-4": 0.0006734006734006734,
+      "sentence_len": 8.458579881656805,
+      "clean_end": 0.0,
+      "avg_words": 95.3,
+      "known_words": 1.0,
+      "example": "\"And I have a lion on my head to keep me safe.\" Lily smiled and said, \"Yes, let's play!\"\nLily and the lion played all day. They ran, jumped, and laughed together. The lion was not lonely anymore. He was happy that he could help his friends. And they all lived happily ever after.\n\nOne day, a little boy named Tim found a toy gun in his room. He liked to pretend he was a small or slow car. He would run around and make loud noises with the other toys. Tim thought it would be fun to use his toy gun to"
+    }
+  },
+  {
+    "name": "diff",
+    "arch": "diff",
+    "heads": 3,
+    "d": 64,
+    "gn": true,
+    "lambda_init": null,
+    "step": 3000,
+    "params": 38739072,
+    "loss": {
+      "all": 1.7481818093284391,
+      "hit": 0.9205316866137393,
+      "other": 1.9237001709543085,
+      "hit_share": 0.1749639730999146
+    },
+    "acts": {
+      "attention logits": [
+        21.587284088134766,
+        20.63460350036621,
+        20.382110595703125,
+        19.831523895263672,
+        18.20348358154297,
+        1.178989291191101
+      ],
+      "hidden states": [
+        12.046672821044922,
+        11.55870246887207,
+        11.508041381835938,
+        11.007478713989258,
+        9.624490737915039,
+        0.39087551832199097
+      ]
+    },
+    "gen": {
+      "distinct-1": 0.18280321565886054,
+      "distinct-2": 0.6453549982338397,
+      "distinct-3": 0.8629061049625134,
+      "repeat-4": 0.0006734006734006734,
+      "sentence_len": 8.341107871720117,
+      "clean_end": 0.1,
+      "avg_words": 95.36666666666666,
+      "known_words": 1.0,
+      "example": "\"And I have a lion on the floor.\" Tim looked at his dad and said, \"You are right. The lion is big and strong. It is my best friend too.\"\nThe lion felt sad and wished to be a good lion. He decided to let Tim take him home. They played together every day and had lots of fun. Tim was happy that he helped a new lion friend, even if he was not a big, scary monster. And they all lived happily ever after.\n\nOnce upon a time, in a small town, there was a boy named Tim. Tim loved to play with his friends."
+    }
+  },
+  {
+    "name": "diff_no_gn",
+    "arch": "diff",
+    "heads": 3,
+    "d": 64,
+    "gn": false,
+    "lambda_init": null,
+    "step": 3000,
+    "params": 38738304,
+    "loss": {
+      "all": 1.7498105348021835,
+      "hit": 0.9352684138818964,
+      "other": 1.922549079090578,
+      "hit_share": 0.1749639730999146
+    },
+    "acts": {
+      "attention logits": [
+        20.149938583374023,
+        20.04035758972168,
+        19.798723220825195,
+        18.92329978942871,
+        17.27968406677246,
+        1.4558472633361816
+      ],
+      "hidden states": [
+        6.401473045349121,
+        6.328496932983398,
+        6.285002708435059,
+        6.193118095397949,
+        5.580304145812988,
+        0.21478858590126038
+      ]
+    },
+    "gen": {
+      "distinct-1": 0.1858684302123216,
+      "distinct-2": 0.6440379880408019,
+      "distinct-3": 0.8656238890863847,
+      "repeat-4": 0.0,
+      "sentence_len": 8.550595238095237,
+      "clean_end": 0.16666666666666666,
+      "avg_words": 95.76666666666667,
+      "known_words": 0.9996519317786287,
+      "example": "\"And I have a lion on my head.\"\nThe next day, Lily's mom said, \"Lily, you can play your flute. But first, you need to put it back where you found it. It is not safe for you.\" Lily was very happy and took the flute home. She wanted her friends to be proud of her. And from that day on, Lily always made sure to share her flute with everyone in the forest.\n\nOne day, a little boy named Tim went outside to play. He saw an icy snowball in the park. The sun was shining, and"
+    }
+  }
+]
