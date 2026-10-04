@@ -34,8 +34,11 @@ on the Hypersphere» (Loshchilov et al., NVIDIA, arXiv:2410.01131).
 import argparse
 import math
 import os
+from pathlib import Path
+import time
+import json
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn as nn
@@ -54,6 +57,16 @@ class ModelConfig:
     rope_base: float = 10000.0
     tie_embeddings: bool = False  # в статье E_input и E_output раздельные
     dropout: float = 0.0        # в статье dropout не упоминается
+
+    def __post_init__(self):
+        for name in ("vocab_size", "block_size", "n_layer", "n_head", "d_model", "mlp_ratio"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} должен быть положительным целым числом")
+        if self.d_model % self.n_head or (self.d_model // self.n_head) % 2:
+            raise ValueError("d_model должен делиться на n_head; размер головы должен быть чётным для RoPE")
+        if not 0 <= self.dropout < 1 or not math.isfinite(self.rope_base) or self.rope_base <= 0:
+            raise ValueError("Требуется 0 <= dropout < 1 и положительный rope_base")
 
 
 # Таблица 2 статьи + маленький пресет для экспериментов на CPU/одной GPU
@@ -192,16 +205,30 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), targets.reshape(-1))
         return logits, loss
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate_tokens(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_token_id=None):
+        """Выдаёт по одному (токен, распределение вероятностей) для потокового вывода."""
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature должна быть положительной")
+        if max_new_tokens < 0 or (top_k is not None and top_k <= 0):
+            raise ValueError("max_new_tokens >= 0, top_k > 0")
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :].float() / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("inf")
-            next_id = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            with torch.no_grad():
+                idx_cond = idx[:, -self.cfg.block_size:]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :].float() / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float("inf")
+                probabilities = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probabilities, num_samples=1)
+                idx = torch.cat([idx, next_id], dim=1)
+            yield next_id, probabilities
+            if eos_token_id is not None and torch.all(next_id == eos_token_id):
+                break
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_token_id=None):
+        for next_id, _ in self.generate_tokens(idx, max_new_tokens, temperature, top_k, eos_token_id):
             idx = torch.cat([idx, next_id], dim=1)
         return idx
 
@@ -274,69 +301,147 @@ def encode_text(tok, text, chunk_chars=1_000_000):
 
 
 # ============================ Обучение ============================
+def select_device(requested="auto"):
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA недоступна")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("GPU Apple (MPS) недоступен; выберите --device cpu")
+    return requested
+
+
+def save_checkpoint(path, model, optimizer, step, best_val_loss, train_args):
+    """Атомарно сохраняет модель, конфигурацию и состояние обучения."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = dict(format_version=1, config=asdict(model.cfg),
+                      model={name: value.detach().cpu() for name, value in model.state_dict().items()},
+                      optimizer=optimizer.state_dict(), step=step, best_val_loss=best_val_loss,
+                      train_args=train_args, tokenizer_repo=TOKENIZER_REPO,
+                      cpu_rng=torch.get_rng_state())
+    device = next(model.parameters()).device.type
+    if device == "mps":
+        checkpoint["device_rng"] = torch.mps.get_rng_state()
+    elif device == "cuda":
+        checkpoint["device_rng"] = torch.cuda.get_rng_state()
+    checkpoint["device"] = device
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    torch.save(checkpoint, temporary)
+    os.replace(temporary, destination)
+
+
+def load_checkpoint(path, device="cpu"):
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if checkpoint.get("format_version") != 1 or checkpoint.get("tokenizer_repo") != TOKENIZER_REPO:
+        raise ValueError("Неподдерживаемый формат модели или другой токенизатор")
+    model = GPT(ModelConfig(**checkpoint["config"]))
+    model.load_state_dict(checkpoint["model"])
+    return model.to(device), checkpoint
+
+
+def load_training_tokens(path, tok):
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Нет файла {source}. Сначала выполните python prepare_dataset.py")
+    cache = Path(f"{source}.mistral.pt")
+    if cache.is_file() and cache.stat().st_mtime >= source.stat().st_mtime:
+        data = torch.load(cache, map_location="cpu", weights_only=True)
+        print(f"Токены загружены из кэша {cache}", flush=True)
+    else:
+        text = source.read_text(encoding="utf-8")
+        data = torch.tensor(encode_text(tok, text), dtype=torch.long)
+        torch.save(data, cache)
+        print(f"{source}: {len(text):,} символов, {len(data):,} токенов", flush=True)
+    return data
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--preset", default="tiny", choices=PRESETS.keys())
     parser.add_argument("--data", default="input.txt")
+    parser.add_argument("--val_data", help="Отдельный файл для проверки; иначе последние 10%% --data")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_iters", type=int, default=5000)
     parser.add_argument("--warmup", type=int, default=200, help="в статье 2000 (на длинных прогонах)")
     parser.add_argument("--lr", type=float, default=1e-3, help="в статье подбирался под задачу")
     parser.add_argument("--eval_every", type=int, default=500)
+    parser.add_argument("--eval_iters", type=int, default=10)
+    parser.add_argument("--save_every", type=int, default=200)
+    parser.add_argument("--checkpoint", default="checkpoints/last.pt")
+    parser.add_argument("--resume", help="Продолжить обучение из сохранённого checkpoint")
+    parser.add_argument("--log_file", default="runs/train.jsonl")
+    parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--generate_tokens", type=int, default=80)
+    for name in ("n_layer", "n_head", "d_model", "block_size", "mlp_ratio"):
+        parser.add_argument(f"--{name}", type=int, help="Переопределить значение пресета")
+    parser.add_argument("--dropout", type=float)
+    parser.add_argument("--rope_base", type=float)
+    parser.add_argument("--tie_embeddings", action="store_true")
     args = parser.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(42)
+    for name in ("batch_size", "max_iters", "eval_every", "eval_iters", "save_every", "threads"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name} должен быть положительным")
+    if args.warmup < 0 or args.generate_tokens < 0 or not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("Требуется warmup >= 0, generate_tokens >= 0 и lr > 0")
+    torch.set_num_threads(args.threads)
+    try:
+        device = select_device(args.device)
+    except ValueError as error:
+        parser.error(str(error))
+    torch.manual_seed(args.seed)
     use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
-
-    # --- данные (в статье — OpenWebText) ---
-    if os.path.exists(args.data):
-        text = open(args.data, encoding="utf-8").read()
-    else:
-        print(f"{args.data} не найден — использую короткий встроенный текст")
-        text = "Привет, мир! Это базовый GPT из статьи про nGPT. " * 2000
-
-    # --- токенизация: Mistral 7B, словарь 32 000 ---
     tok = load_tokenizer()
-    vocab_size = tok.vocab_size
-    cache = f"{args.data}.mistral.pt"
-    if os.path.exists(args.data) and os.path.exists(cache) \
-            and os.path.getmtime(cache) >= os.path.getmtime(args.data):
-        data = torch.load(cache)
-        print(f"Токены загружены из кэша {cache}")
+    try:
+        data = load_training_tokens(args.data, tok)
+        if args.val_data:
+            splits = {"train": data, "val": load_training_tokens(args.val_data, tok)}
+        else:
+            n = int(0.9 * len(data))
+            splits = {"train": data[:n], "val": data[n:]}
+    except FileNotFoundError as error:
+        parser.error(str(error))
+
+    if args.resume:
+        model, saved = load_checkpoint(args.resume, device)
+        cfg = model.cfg
+        start_step = saved["step"]
+        best_val_loss = saved["best_val_loss"]
     else:
-        data = torch.tensor(encode_text(tok, text), dtype=torch.long)
-        if os.path.exists(args.data):
-            torch.save(data, cache)
-    bos_id = tok.bos_token_id
-    decode = lambda ids: tok.decode(ids, skip_special_tokens=True)
-
-    print(f"Символов: {len(text):,} | токенов: {len(data):,} | "
-          f"символов на токен: {len(text) / len(data):.2f}")
-
-    cfg = ModelConfig(vocab_size=vocab_size, **PRESETS[args.preset])
+        settings = dict(PRESETS[args.preset])
+        for name in ("n_layer", "n_head", "d_model", "block_size", "mlp_ratio", "dropout", "rope_base"):
+            if getattr(args, name) is not None:
+                settings[name] = getattr(args, name)
+        try:
+            cfg = ModelConfig(vocab_size=tok.vocab_size, tie_embeddings=args.tie_embeddings, **settings)
+        except ValueError as error:
+            parser.error(str(error))
+        model = GPT(cfg).to(device)
+        start_step, best_val_loss = 0, float("inf")
+    if args.max_iters <= start_step:
+        parser.error(f"--max_iters должен быть больше сохранённого шага {start_step}")
     T = cfg.block_size
-    n = int(0.9 * len(data))
-    splits = {"train": data[:n], "val": data[n:]}
-    if len(splits["val"]) <= T + 1:
-        raise ValueError(f"Слишком мало данных: в val-части {len(splits['val'])} токенов, "
-                         f"нужно больше block_size={T}. Возьмите текст побольше.")
+    for name, part in splits.items():
+        if len(part) < T + 1:
+            parser.error(f"Слишком мало данных в {name}: {len(part)} токенов; нужно хотя бы {T + 1}")
 
     def get_batch(split):
         d = splits[split]
-        ix = torch.randint(len(d) - T - 1, (args.batch_size,))
+        ix = torch.randint(len(d) - T, (args.batch_size,))
         x = torch.stack([d[i:i + T] for i in ix])
         y = torch.stack([d[i + 1:i + T + 1] for i in ix])
         return x.to(device), y.to(device)
 
     @torch.no_grad()
-    def estimate_loss(model, iters=50):
+    def estimate_loss(model):
         model.eval()
         out = {}
         for split in ("train", "val"):
-            losses = torch.zeros(iters)
-            for i in range(iters):
+            losses = torch.zeros(args.eval_iters)
+            for i in range(args.eval_iters):
                 x, y = get_batch(split)
                 with autocast:
                     _, loss = model(x, y)
@@ -345,31 +450,73 @@ def main():
         model.train()
         return out
 
-    model = GPT(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Пресет {args.preset}: {n_params / 1e6:.2f}M параметров, устройство {device}, bf16={use_bf16}")
+    print(f"Модель: {n_params / 1e6:.2f}M параметров, устройство {device}, bf16={use_bf16}", flush=True)
+    print(f"Конфигурация: {asdict(cfg)}", flush=True)
     optimizer = make_optimizer(model, args.lr)
+    if args.resume:
+        optimizer.load_state_dict(saved["optimizer"])
+        torch.set_rng_state(saved["cpu_rng"])
+        if saved.get("device") == device and "device_rng" in saved:
+            if device == "mps":
+                torch.mps.set_rng_state(saved["device_rng"])
+            elif device == "cuda":
+                torch.cuda.set_rng_state(saved["device_rng"])
+        print(f"Продолжаю с шага {start_step}", flush=True)
 
-    for step in range(args.max_iters + 1):
-        lr = lr_at(step, args.lr, args.warmup, args.max_iters)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
-        if step % args.eval_every == 0:
-            l = estimate_loss(model)
-            print(f"шаг {step:5d} | lr {lr:.2e} | train {l['train']:.3f} | val {l['val']:.3f}")
-        x, y = get_batch("train")
+    log_path = Path(args.log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    best_path = Path(args.checkpoint).with_name(Path(args.checkpoint).stem + ".best.pt")
+    completed = start_step
+    began = time.monotonic()
+
+    def evaluate(step):
+        nonlocal best_val_loss
+        losses = estimate_loss(model)
+        elapsed = time.monotonic() - began
+        lr = optimizer.param_groups[0]["lr"]
+        print(f"шаг {step:5d} | lr {lr:.2e} | train {losses['train']:.3f} | val {losses['val']:.3f} | {elapsed:.1f} с", flush=True)
+        record = dict(step=step, train_loss=losses["train"], val_loss=losses["val"],
+                      elapsed_seconds=elapsed, lr=lr, device=device)
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(json.dumps(record) + "\n")
+        if losses["val"] < best_val_loss:
+            best_val_loss = losses["val"]
+            save_checkpoint(best_path, model, optimizer, step, best_val_loss, vars(args))
+
+    try:
+        evaluate(start_step)
+        for step in range(start_step, args.max_iters):
+            lr = lr_at(step, args.lr, args.warmup, args.max_iters)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            x, y = get_batch("train")
+            with autocast:
+                _, loss = model(x, y)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Loss перестал быть конечным на шаге {step}")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            completed = step + 1
+            if completed % args.eval_every == 0 or completed == args.max_iters:
+                evaluate(completed)
+            if completed % args.save_every == 0:
+                save_checkpoint(args.checkpoint, model, optimizer, completed, best_val_loss, vars(args))
+    except KeyboardInterrupt:
+        print("\nОбучение остановлено; сохраняю выполненные шаги.", flush=True)
+    finally:
+        save_checkpoint(args.checkpoint, model, optimizer, completed, best_val_loss, vars(args))
+        print(f"Сохранено: {args.checkpoint}, шаг {completed}", flush=True)
+
+    if args.generate_tokens:
+        model.eval()
+        start = torch.tensor([[tok.bos_token_id]], dtype=torch.long, device=device)
         with autocast:
-            _, loss = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-    model.eval()
-    start = torch.tensor([[bos_id]], dtype=torch.long, device=device)
-    with autocast:
-        out = model.generate(start, max_new_tokens=300, temperature=0.8, top_k=20)
-    print("\n--- Сгенерированный текст ---\n" + decode(out[0].tolist()))
+            out = model.generate(start, max_new_tokens=args.generate_tokens, temperature=0.8, top_k=20,
+                                 eos_token_id=tok.eos_token_id)
+        print("\n--- Сгенерированный текст ---\n" + tok.decode(out[0].tolist(), skip_special_tokens=True), flush=True)
 
 
 if __name__ == "__main__":

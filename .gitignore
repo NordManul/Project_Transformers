@@ -5,3 +5,6 @@ __pycache__/
 .idea/
 *.pt
 *.bin
+data/
+checkpoints/
+runs/
