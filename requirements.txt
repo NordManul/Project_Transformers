@@ -13,4 +13,4 @@ sentencepiece>=0.1.99
 numpy
 
 # Тесты
-pytest>=7.0
+pytest>=7.0matplotlib
