@@ -210,3 +210,12 @@ def test_full_experiment_on_cpu(tmp_path, monkeypatch):
     assert len(summary["final"]["gpt"]) == 2 and len(summary["speedups"]) == 2
     assert (out / "report" / "ngpt_vs_gpt.png").stat().st_size > 0
     assert (out / "report" / "details" / "loss.png").stat().st_size > 0
+
+
+def test_curve_speedup():
+    gpt = [(100, 5.0), (200, 4.0), (300, 3.5)]
+    ngpt = [(100, 4.5), (200, 3.3), (300, 3.0)]
+    reached, target, total = exp.curve_speedup(gpt, ngpt)
+    assert target == 3.5 and total == 300
+    assert reached == pytest.approx(100 + (4.5 - 3.5) / (4.5 - 3.3) * 100)
+    assert exp.curve_speedup(gpt, [(100, 6.0), (300, 4.0)])[0] is None

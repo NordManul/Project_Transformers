@@ -334,6 +334,20 @@ def tokens_to_reach(points, target):
     return "=", mono[-1][0]
 
 
+def curve_speedup(gpt_val, ngpt_val):
+    """Ускорение по кривым одного бюджета: на скольких токенах nGPT впервые дошёл до финального val loss GPT.
+    gpt_val, ngpt_val: [(токены, val loss)] по ходу обучения (фиксированный набор окон).
+    Возвращает (токены nGPT или None, если не дошёл; финальный loss GPT; токены GPT)."""
+    gpt_val, ngpt_val = sorted(gpt_val), sorted(ngpt_val)
+    target_tokens, target = gpt_val[-1]
+    for (t0, l0), (t1, l1) in zip(ngpt_val, ngpt_val[1:]):
+        if l1 <= target:
+            if l0 <= target:
+                return t0, target, target_tokens
+            return t0 + (l0 - target) / (l0 - l1) * (t1 - t0), target, target_tokens
+    return None, target, target_tokens
+
+
 def collect(out):
     runs = Path(out) / "runs"
     rows = []
@@ -423,6 +437,36 @@ def report(out, quiet=False):
                          f"{fmt_count(need)} токенов → ускорение {text}")
     else:
         lines.append("- пока не хватает законченных прогонов")
+    # ускорение по кривым обучения: прогоны GPT и nGPT с одинаковым бюджетом
+    curve_speedups = []
+    for t_budget in sorted({r["tokens"] for r in done if r["model"] == "gpt"} &
+                           {r["tokens"] for r in done if r["model"] == "ngpt"}):
+        pick = {}
+        for m in MODELS:
+            same = [r for r in done if r["model"] == m and r["tokens"] == t_budget and not r["final"].get("diverged")]
+            if same:
+                pick[m] = min(same, key=loss)
+        if len(pick) < 2:
+            continue
+        vals = {m: [(v["tokens"], v["val_loss"]) for v in read_metrics(pick[m]["dir"])
+                    if v["type"] == "val" and v["step"] > 0] for m in MODELS}
+        if len(vals["gpt"]) < 2 or len(vals["ngpt"]) < 2:
+            continue
+        reached, target, gpt_tokens = curve_speedup(vals["gpt"], vals["ngpt"])
+        if not curve_speedups:
+            lines += ["", "## Ускорение по кривым обучения (один бюджет)", "",
+                      "На скольких токенах nGPT впервые дошёл до финального val loss GPT того же бюджета.", ""]
+        if reached is None:
+            lines.append(f"- бюджет {fmt_count(t_budget)}: GPT в конце {target:.4f}, nGPT до этого loss не дошёл")
+            curve_speedups.append(dict(tokens=t_budget, ratio=None))
+        else:
+            ratio = gpt_tokens / reached
+            lines.append(f"- бюджет {fmt_count(t_budget)}: GPT дошёл до {target:.4f} за {fmt_count(gpt_tokens)} токенов, "
+                         f"nGPT — за {fmt_count(int(reached))} → ускорение ≈ {ratio:.2f}x")
+            curve_speedups.append(dict(tokens=t_budget, ratio=ratio, ngpt_tokens=reached))
+    if curve_speedups:
+        lines.append("  (оценка внутри одного прогона: у GPT и nGPT своё расписание lr, поэтому она приблизительная)")
+
     speed = {m: [r["tok_s"] for r in done if r["model"] == m and r["tok_s"]] for m in MODELS}
     if speed["gpt"] and speed["ngpt"]:
         sg, sn = sum(speed["gpt"]) / len(speed["gpt"]), sum(speed["ngpt"]) / len(speed["ngpt"])
@@ -483,7 +527,7 @@ def report(out, quiet=False):
     (rep / "summary.json").write_text(json.dumps(dict(
         best_lr={m: best[m]["lr"] for m in best},
         final={m: [(t, l) for t, l, _ in curve[m]] for m in MODELS},
-        speedups=speedups), indent=2), encoding="utf-8")
+        speedups=speedups, curve_speedups=curve_speedups), indent=2), encoding="utf-8")
     if not quiet:
         print(text)
         print(f"Отчёт: {rep}")
