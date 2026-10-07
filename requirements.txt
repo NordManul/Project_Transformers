@@ -1,16 +1,16 @@
-# Окружение для baseline_gpt.py (базовый GPT из статьи nGPT, arXiv:2410.01131)
 # Python 3.10+
-#
-# PyTorch с поддержкой GPU лучше ставить командой с pytorch.org под вашу версию CUDA,
-# например: pip install torch --index-url https://download.pytorch.org/whl/cu124
-# Строка ниже поставит сборку по умолчанию для вашей платформы.
+# PyTorch с GPU лучше ставить командой с pytorch.org под вашу версию CUDA.
+# На Kaggle torch уже установлен.
 torch>=2.1
 
-# Токенизатор LLaMA-2 и эталонная LlamaForCausalLM для тестов
+# Токенизатор Mistral 7B и эталонная модель LLaMA для тестов
 transformers>=4.40
 sentencepiece>=0.1.99
 
+# Данные и графики
 numpy
+datasets>=2.18
+matplotlib
 
 # Тесты
-pytest>=7.0matplotlib
+pytest>=7.0
