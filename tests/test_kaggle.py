@@ -219,3 +219,56 @@ def test_curve_speedup():
     assert target == 3.5 and total == 300
     assert reached == pytest.approx(100 + (4.5 - 3.5) / (4.5 - 3.3) * 100)
     assert exp.curve_speedup(gpt, [(100, 6.0), (300, 4.0)])[0] is None
+
+
+def test_plan_seeds_and_per_model_lrs():
+    plan = dict(exp.DEFAULT_PLAN, budgets="775M", lrs="3e-3", lrs_gpt="1.5e-3", lrs_ngpt="6e-3,1.2e-2",
+                seed=43, data_seed=1235)
+    jobs = exp.make_jobs(plan)
+    assert [j["name"] for j in jobs] == ["gpt_775M_lr0.0015_s43", "ngpt_775M_lr0.006_s43", "ngpt_775M_lr0.012_s43"]
+    cmd = exp.train_command(plan, jobs[0], 1.5e-3, "data", Path("runs"), "cpu", 0)
+    assert cmd[cmd.index("--seed") + 1] == "43" and cmd[cmd.index("--data_seed") + 1] == "1235"
+    assert cmd[cmd.index("--val_seed") + 1] == "1235"
+    default = exp.make_jobs(dict(exp.DEFAULT_PLAN, budgets="775M", lrs="3e-3"))
+    assert [j["name"] for j in default] == ["gpt_775M_lr0.003", "ngpt_775M_lr0.003"]   # имена как в старых прогонах
+
+
+def _fake_run(root, name, model, lr, seed, final_loss, vals):
+    d = root / "runs" / name
+    d.mkdir(parents=True)
+    (d / "config.json").write_text(json.dumps(dict(model_name=model, tokens_per_step=100, n_params=1,
+                                                   args=dict(lr=lr, seed=seed, max_iters=10))), encoding="utf-8")
+    recs = [dict(type="val", step=i + 1, tokens=(i + 1) * 100, val_loss=v) for i, v in enumerate(vals)]
+    recs += [dict(type="train", step=10, tokens=1000, loss=1.0, lr=lr, grad_norm=1.0, elapsed=1.0, tokens_per_sec=100.0),
+             dict(type="final", val_loss=final_loss, perplexity=1.0, tokens=100, step=10, tokens_trained=1000,
+                  elapsed=1.0)]
+    (d / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
+
+
+def test_report_merges_sweep_from_several_people(tmp_path):
+    """Прогоны разных участников (разные lr и сиды) в одной папке -> лучший lr по среднему, разброс сидов."""
+    root = tmp_path / "all"
+    _fake_run(root, "gpt_1K_lr0.003", "gpt", 3e-3, 42, 3.36, [4.0, 3.5, 3.36])
+    _fake_run(root, "ngpt_1K_lr0.003", "ngpt", 3e-3, 42, 3.25, [3.9, 3.3, 3.25])
+    _fake_run(root, "gpt_1K_lr0.0015", "gpt", 1.5e-3, 42, 3.34, [4.0, 3.5, 3.34])
+    _fake_run(root, "ngpt_1K_lr0.0015", "ngpt", 1.5e-3, 42, 3.28, [3.9, 3.4, 3.28])
+    _fake_run(root, "gpt_1K_lr0.0015_s43", "gpt", 1.5e-3, 43, 3.36, [4.0, 3.5, 3.36])
+    _fake_run(root, "ngpt_1K_lr0.003_s43", "ngpt", 3e-3, 43, 3.27, [3.9, 3.3, 3.27])
+    exp.report(root, quiet=True)
+    text = (root / "report" / "report.md").read_text(encoding="utf-8")
+    summary = json.loads((root / "report" / "summary.json").read_text())
+    assert summary["best_lr"] == {"gpt": 0.0015, "ngpt": 0.003}
+    assert "Разброс по сидам" in text and "сид 43" in text
+    assert len(summary["curve_speedups"]) == 2           # по одному на сид
+
+
+def test_accounts_split_balanced():
+    """Распределение короткого свипа по 4 аккаунтам: у каждого аккаунта две GPU."""
+    base = dict(exp.DEFAULT_PLAN, budgets="150M", lrs="3e-3")
+    acc = {1: dict(lrs_gpt="none", lrs_ngpt="7.5e-4,1.5e-3"),
+           3: dict(lrs_gpt="7.5e-4,1.5e-3", lrs_ngpt="3e-3"),
+           4: dict(lrs_gpt="3e-3,6e-3,1.2e-2", lrs_ngpt="none")}
+    names = {k: [j["name"] for j in exp.make_jobs(dict(base, **v))] for k, v in acc.items()}
+    assert names[1] == ["ngpt_150M_lr0.00075", "ngpt_150M_lr0.0015"]
+    assert names[3] == ["gpt_150M_lr0.00075", "ngpt_150M_lr0.003", "gpt_150M_lr0.0015"]
+    assert names[4] == ["gpt_150M_lr0.003", "gpt_150M_lr0.006", "gpt_150M_lr0.012"]

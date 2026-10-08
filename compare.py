@@ -359,7 +359,8 @@ def cmd_train(args):
     n_params = sum(p.numel() for p in model.parameters())
 
     data_gen = torch.Generator().manual_seed(args.data_seed)
-    val_windows = fixed_windows(val_data, T, args.eval_batches * args.batch_size, args.data_seed + 1)
+    val_seed = args.val_seed if args.val_seed is not None else args.data_seed + 1
+    val_windows = fixed_windows(val_data, T, args.eval_batches * args.batch_size, val_seed)
 
     def train_batch():
         """Один шаг = batch_size окон; индексы берутся сразу на весь шаг, поэтому батчи
@@ -388,6 +389,12 @@ def cmd_train(args):
                       model_config=asdict(model.cfg), args=vars(args))
         if device == "cuda":
             config["gpu"] = torch.cuda.get_device_name()
+        try:   # версия кода — чтобы прогоны разных людей можно было сверить
+            import subprocess
+            config["git_commit"] = subprocess.run(["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"],
+                                                  capture_output=True, text=True, timeout=10).stdout.strip()
+        except Exception:
+            pass
         (run_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     log = metrics_path.open("a" if resume else "w", encoding="utf-8")
 
@@ -721,6 +728,7 @@ def main():
     t.add_argument("--final_eval_tokens", type=int, default=0, help="0 — вся отложенная выборка")
     t.add_argument("--seed", type=int, default=42, help="инициализация модели")
     t.add_argument("--data_seed", type=int, default=1234, help="порядок батчей и val-набор — одинаковы для всех моделей")
+    t.add_argument("--val_seed", type=int, help="какие окна берутся в фиксированный val-набор; по умолчанию data_seed+1")
     t.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     t.add_argument("--dtype", default="auto", choices=["auto", "bf16", "fp16", "fp32"],
                    help="auto: bf16 на Ampere и новее, fp16 + GradScaler на T4/P100/V100")
