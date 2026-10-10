@@ -44,6 +44,9 @@ DEFAULT_PLAN = dict(
     lrs="1e-3,2e-3,4e-3",
     lrs_gpt="",                             # своя сетка lr для GPT (пусто — как lrs, "none" — без GPT)
     lrs_ngpt="",                            # своя сетка lr для nGPT (пусто — как lrs, "none" — без nGPT)
+    jobs="",                                # явный список прогонов "модель:бюджет:lr,...", например
+                                            # "gpt:1.4B:3e-3,ngpt:450M:3.8e-3" (лестница бюджетов); тогда
+                                            # budgets/lrs не используются
     seed=42,                                # начальные веса
     data_seed=1234,                         # порядок батчей (одинаковый у GPT и nGPT)
     scale_ref_dim=1024,                     # масштабы nGPT учатся как у модели 0.5B из статьи (см. ngpt.py)
@@ -84,6 +87,17 @@ def make_jobs(plan):
 
     def steps(budget):
         return max(1, round(budget * plan["budget_scale"] / tokens_per_step))
+
+    if plan.get("jobs"):   # явный список: у каждого прогона свой бюджет и свой lr; длинные — первыми
+        jobs = []
+        for item in plan["jobs"].split(","):
+            model, budget, lr = (x.strip() for x in item.split(":"))
+            if model not in MODELS:
+                raise ValueError(f"--jobs: неизвестная модель {model!r} (нужно gpt или ngpt)")
+            budget, lr = parse_count(budget), float(lr)
+            jobs.append(dict(name=f"{model}_{fmt_count(budget)}_lr{lr:g}{suffix}", model=model, lr=lr,
+                             budget=budget, steps=steps(budget), stage="sweep"))
+        return sorted(jobs, key=lambda j: -j["steps"])
 
     jobs = []
     for i in range(max(len(v) for v in lrs.values()) if any(lrs.values()) else 0):   # 1. свип: модели вперемешку, чтобы обе GPU были заняты
@@ -374,7 +388,7 @@ def collect(out):
         fin = next((r for r in reversed(records) if r["type"] == "final"), None)
         train = [r for r in records if r["type"] == "train"]
         rows.append(dict(name=d.name, dir=d, model=cfg["model_name"], lr=cfg["args"]["lr"],
-                         seed=cfg["args"].get("seed", 42),
+                         seed=cfg["args"].get("seed", 42), ctx=cfg["args"].get("block_size"),
                          tokens=cfg["args"]["max_iters"] * cfg["tokens_per_step"],
                          stage="sweep" if "_lr" in d.name else "main", final=fin,
                          tok_s=train[-1]["tokens_per_sec"] if train else None,
@@ -395,9 +409,18 @@ def report(out, quiet=False):
         return None
     rep = out / "report"
     rep.mkdir(parents=True, exist_ok=True)
+    lines = ["# nGPT против GPT", ""]
+    ctxs = {}
+    for r in rows:
+        ctxs[r["ctx"]] = ctxs.get(r["ctx"], 0) + 1
+    if len(ctxs) > 1:   # loss при разной длине контекста несравним: берём самый частый контекст
+        main_ctx = max(ctxs, key=ctxs.get)
+        skipped = sorted(r["name"] for r in rows if r["ctx"] != main_ctx)
+        rows = [r for r in rows if r["ctx"] == main_ctx]
+        lines += [f"Внимание: в папке прогоны с разным контекстом. В отчёте только контекст {main_ctx}; "
+                  f"пропущены: {', '.join(skipped)}", ""]
     done = [r for r in rows if r["final"]]
     loss = lambda r: r["final"]["val_loss"]   # noqa: E731
-    lines = ["# nGPT против GPT", ""]
 
     # --- lr-свип (несколько сидов на один lr усредняются) ---
     sweep = [r for r in rows if r["stage"] == "sweep"]
@@ -408,7 +431,10 @@ def report(out, quiet=False):
             val = ("разошлось" if r["final"].get("diverged") else f"{loss(r):.4f}") if r["final"] \
                 else f"идёт ({r['progress']:.0%})"
             lines.append(f"| {r['model']} | {r['lr']:g} | {r['seed']} | {fmt_count(r['tokens'])} | {val} |")
-        top_budget = max(r["tokens"] for r in sweep)
+        # лучший lr выбираем на самом длинном бюджете, где есть обе модели (полная проверка свипа)
+        both = [t for t in {r["tokens"] for r in sweep if r["final"]}
+                if all(any(r["model"] == m and r["tokens"] == t and r["final"] for r in sweep) for m in MODELS)]
+        top_budget = max(both) if both else max(r["tokens"] for r in sweep)
         budgets_in_sweep = sorted({r["tokens"] for r in sweep})
         if len(budgets_in_sweep) > 1:   # свип на нескольких бюджетах (короткий + полный): лучший lr на каждом
             lines.append("")
@@ -464,21 +490,35 @@ def report(out, quiet=False):
                           (f"; среднее {sum(d for _, d in diffs) / len(diffs):+.4f}" if len(diffs) > 1 else "")]
         lines.append("")
 
-    # --- финальный loss по бюджетам: лучшая точка свипа + основные прогоны ---
+    # --- финальный loss по бюджетам: на каждом бюджете лучший lr (среднее по сидам), как в статье ---
     curve = {m: [] for m in MODELS}
     for m in MODELS:
-        pts = [r for r in done if r["model"] == m and r["stage"] == "main"]
-        if m in best:
-            pts.append(best[m])
-        curve[m] = sorted(((r["tokens"], loss(r), r) for r in pts if not r["final"].get("diverged")),
-                          key=lambda t: t[0])
-    lines += ["## Итоговый val loss по бюджетам", "", "| токенов | GPT | nGPT | разница |", "|---|---|---|---|"]
+        by_budget = {}
+        for r in done:
+            if r["model"] == m and not r["final"].get("diverged"):
+                by_budget.setdefault(r["tokens"], {}).setdefault(r["lr"], []).append(r)
+        for t, groups in by_budget.items():
+            lr_best = min(groups, key=lambda lr: sum(loss(r) for r in groups[lr]) / len(groups[lr]))
+            g = groups[lr_best]
+            curve[m].append((t, sum(loss(r) for r in g) / len(g), dict(lr=lr_best, seeds=len(g),
+                                                                  run=min(g, key=lambda r: (r["seed"] != 42, r["seed"])))))
+        curve[m].sort(key=lambda t: t[0])
+
+    def cell(m, b):
+        p = next((x for x in curve[m] if x[0] == b), None)
+        if p is None:
+            return "—", None
+        extra = f" (lr {p[2]['lr']:g}" + (f", {p[2]['seeds']} сида" if p[2]["seeds"] > 1 else "") + ")"
+        return f"{p[1]:.4f}{extra}", p[1]
+
+    lines += ["## Итоговый val loss по бюджетам", "",
+              "На каждом бюджете — лучший lr этой модели (при нескольких сидах — среднее).", "",
+              "| токенов | GPT | nGPT | разница |", "|---|---|---|---|"]
     budgets = sorted({t for m in MODELS for t, _, _ in curve[m]})
     for b in budgets:
-        g = next((l for t, l, _ in curve["gpt"] if t == b), None)
-        n = next((l for t, l, _ in curve["ngpt"] if t == b), None)
+        (gt, g), (nt, n) = cell("gpt", b), cell("ngpt", b)
         diff = f"{n - g:+.4f}" if g is not None and n is not None else "—"
-        lines.append(f"| {fmt_count(b)} | {g if g is None else f'{g:.4f}'} | {n if n is None else f'{n:.4f}'} | {diff} |")
+        lines.append(f"| {fmt_count(b)} | {gt} | {nt} | {diff} |")
 
     # --- ускорение ---
     lines += ["", "## Ускорение nGPT", "",
@@ -497,6 +537,19 @@ def report(out, quiet=False):
                          f"{fmt_count(need)} токенов → ускорение {text}")
     else:
         lines.append("- пока не хватает законченных прогонов")
+    speedups_reverse = []
+    if len(curve["ngpt"]) >= 2 and curve["gpt"]:
+        lines += ["", "Сколько токенов нужно nGPT, чтобы дойти до того же val loss, что у GPT на бюджете D.", ""]
+        ngpt_pts = [(t, l) for t, l, _ in curve["ngpt"]]
+        for t, l, _ in curve["gpt"]:
+            sign, need = tokens_to_reach(ngpt_pts, l)
+            ratio = t / need
+            text = {"=": f"≈ {ratio:.2f}x",
+                    ">": f"меньше {ratio:.2f}x (nGPT не дошёл до этого loss даже на {fmt_count(need)})",
+                    "<": f"больше {ratio:.2f}x (nGPT уже на {fmt_count(need)} лучше)"}[sign]
+            speedups_reverse.append(dict(tokens=t, sign=sign, ratio=ratio))
+            lines.append(f"- GPT на {fmt_count(t)} (loss {l:.4f}): nGPT нужно {'' if sign == '=' else sign + ' '}"
+                         f"{fmt_count(need)} токенов → ускорение {text}")
     # ускорение по кривым обучения: прогоны GPT и nGPT с одинаковым бюджетом
     curve_speedups = []
     for t_budget in sorted({r["tokens"] for r in done if r["model"] == "gpt"} &
@@ -541,7 +594,7 @@ def report(out, quiet=False):
 
     # --- графики ---
     colors = compare.COLORS
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
+    fig, axes = plt.subplots(1, 3, figsize=(19, 4.6))
     ax = axes[0]
     for m in MODELS:
         if curve[m]:
@@ -555,24 +608,57 @@ def report(out, quiet=False):
     if ax.get_legend_handles_labels()[0]:
         ax.legend()
     ax = axes[1]
+    # свип рисуем на бюджете, где перебрано больше всего lr
+    sweep_done = [r for r in sweep if r["final"] and math.isfinite(loss(r))]
+    plot_budget = max({r["tokens"] for r in sweep_done},
+                      key=lambda t: (len({r["lr"] for r in sweep_done if r["tokens"] == t}), -t)) if sweep_done else None
     for m in MODELS:
-        means = {lr: v for lr, v in mean_by_lr.get(m, {}).items() if math.isfinite(v)}
+        groups = {}
+        for r in sweep_done:
+            if r["model"] == m and r["tokens"] == plot_budget:
+                groups.setdefault(r["lr"], []).append(loss(r))
+        means = {lr: sum(v) / len(v) for lr, v in groups.items()}
         if means:
             xs = sorted(means)
             ax.plot(xs, [means[x] for x in xs], marker="o", color=colors[m], ls=compare.STYLES[m], label=m.upper())
     ax.set_xscale("log")
     ax.set_xlabel("learning rate")
     ax.set_ylabel("итоговый val loss")
-    ax.set_title(f"lr-свип ({fmt_count(sweep[0]['tokens']) if sweep else '—'} токенов)")
+    ax.set_title(f"lr-свип ({fmt_count(plot_budget) if plot_budget else '—'} токенов)")
     ax.grid(alpha=0.3, which="both")
     if ax.get_legend_handles_labels()[0]:
         ax.legend()
+    # ускорение по лестнице бюджетов (как в статье): растёт ли оно с длиной обучения
+    ax = axes[2]
+    for data, key, label, color, mk in ((speedups, "tokens", "GPT нужно в N раз больше токенов до loss nGPT",
+                                         colors["ngpt"], "o"),
+                                        (speedups_reverse, "tokens", "nGPT нужно в N раз меньше токенов до loss GPT",
+                                         colors["gpt"], "s")):
+        pts = [(d[key], d["ratio"], d["sign"]) for d in data]
+        exact = [(t, r) for t, r, sg in pts if sg == "="]
+        bound = [(t, r) for t, r, sg in pts if sg != "="]
+        if exact:
+            ax.plot([t for t, _ in exact], [r for _, r in exact], marker=mk, color=color, label=label)
+        if bound:
+            ax.scatter([t for t, _ in bound], [r for _, r in bound], marker=mk, facecolors="none",
+                       edgecolors=color, label="граница (вне диапазона бюджетов)" if exact or not pts else label)
+    ax.axhline(1.0, color="gray", lw=0.8, ls=":")
+    ax.set_xscale("log")
+    ax.set_xlabel("бюджет, токенов (nGPT для кружков, GPT для квадратов)")
+    ax.set_ylabel("ускорение nGPT, раз")
+    ax.set_title("Ускорение по лестнице бюджетов")
+    ax.grid(alpha=0.3, which="both")
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(rep / "ngpt_vs_gpt.png", dpi=130)
     plt.close(fig)
 
     # подробные графики compare.py: кривые обучения, градиенты, активации — для лучших прогонов
     detail = [r for r in rows if r["stage"] == "main" or best.get(r["model"]) is r]
+    for m in MODELS:   # и прогон каждой модели на самом длинном бюджете
+        if curve[m] and all(curve[m][-1][2]["run"] is not r for r in detail):
+            detail.append(curve[m][-1][2]["run"])
     detail = [r for r in detail if read_metrics(r["dir"])]
     if detail:
         old_stdout = sys.stdout
@@ -591,7 +677,8 @@ def report(out, quiet=False):
     (rep / "summary.json").write_text(json.dumps(dict(
         best_lr={m: best[m]["lr"] for m in best},
         final={m: [(t, l) for t, l, _ in curve[m]] for m in MODELS},
-        speedups=speedups, curve_speedups=curve_speedups), indent=2), encoding="utf-8")
+        speedups=speedups, speedups_reverse=speedups_reverse, curve_speedups=curve_speedups), indent=2),
+        encoding="utf-8")
     if not quiet:
         print(text)
         print(f"Отчёт: {rep}")

@@ -1,0 +1,164 @@
+# Лестница бюджетов nGPT против GPT — аккаунт C
+
+## Зачем
+
+Мы хотим увидеть главный результат статьи nGPT: **nGPT доходит до того же качества, что GPT,
+за в несколько раз меньшее число токенов, и этот выигрыш растёт с длиной обучения.**
+Статья считает это «лестницей бюджетов»: каждую модель учат несколько раз с разным числом токенов
+(у каждого бюджета своё полное расписание lr) и смотрят, на каком бюджете nGPT получает тот же
+итоговый loss, что GPT на своём. Три аккаунта делят лестницу между собой; уже готовые прогоны
+(150M и 775M) тоже входят в неё.
+
+**Твоя часть (аккаунт C):** **Ступень GPT 1.4 млрд токенов (два lr), GPT 450M** и проверка краёв lr на 775M: GPT с lr 0.0042 и nGPT с lr 0.002. Эти два lr на 775M мы ещё не пробовали — закрываем вопрос «а вдруг GPT просто не повезло с lr».
+
+| Прогон | Модель | Токенов | lr | Время на T4 |
+|---|---|---|---|---|
+| `gpt_1.4B_lr0.003` | GPT | 1.4B | 0.003 | ~10.2 ч |
+| `gpt_1.4B_lr0.002` | GPT | 1.4B | 0.002 | ~10.2 ч |
+| `ngpt_775M_lr0.002` | NGPT | 775M | 0.002 | ~8.5 ч |
+| `gpt_775M_lr0.0042` | GPT | 775M | 0.0042 | ~5.7 ч |
+| `gpt_450M_lr0.003` | GPT | 450M | 0.003 | ~3.3 ч |
+
+Модель как во всех прошлых прогонах: 6 слоёв, d = 384, контекст 1024, батч 64 × 1024, сид 42.
+Обе видеокарты T4 заняты все сессии. Нужно две сессии по ~11.5 ч (первая почти целиком уйдёт на GPT 1.4B). Квота: ~23 из 30 часов в неделю.
+Вторая сессия — та же кнопка «Save & Run All», обучение продолжается с того же места.
+
+---
+
+## 1. Подготовка (один раз)
+
+1. **Create → New Notebook**, переименуй в **`ngpt-ladder-c`**.
+2. Справа: **Accelerator → GPU T4 x2**, **Internet → On**, **Input — пустой**.
+3. Сделай **четыре ячейки с кодом** и скопируй в них текст ниже **целиком, ничего не меняя**.
+
+### Ячейка 1 — настройки
+
+```python
+# ===== Настройки аккаунта C (ничего не менять) =====
+JOBS = "gpt:1.4B:3e-3,gpt:1.4B:2e-3,ngpt:775M:2e-3,gpt:775M:4.2e-3,gpt:450M:3e-3"   # модель:бюджет:lr
+TRAIN_TOKENS = "1.5e9"   # данных больше, чем самый длинный прогон: без повторов
+NAME = "ladder_C"
+
+SESSION_HOURS = 11.5
+REPO = "https://github.com/NordManul/Project_Transformers.git"
+PLAN = ("--n_layer 6 --n_head 6 --d_model 384 --block_size 1024 --batch_size 64 --micro_batch 8 "
+        f"--jobs {JOBS} --seed 42 --data_seed 1234")
+
+import glob, json, os, shutil, subprocess, time
+T0 = time.time()
+WORK = "/kaggle/working"
+CODE = f"{WORK}/Project_Transformers"
+DATA = f"{WORK}/data/owt"
+if not os.path.exists(CODE):
+    subprocess.run(["git", "clone", "--depth", "1", REPO, CODE], check=True)
+os.chdir(CODE)
+print("код:", subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip())
+import torch
+print("torch", torch.__version__, "| GPU:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
+
+OUT = f"{WORK}/runs/{NAME}"
+print("PLAN:", PLAN)
+print("OUT:", OUT)
+```
+
+### Ячейка 2 — данные (~22 минуты в первой сессии) и продолжение прошлой сессии
+
+```python
+found = sorted(glob.glob("/kaggle/input/**/data/owt/train.bin", recursive=True))
+if os.path.exists(f"{DATA}/train.bin"):
+    print("Данные уже на месте")
+elif found and json.load(open(os.path.join(os.path.dirname(found[0]), "meta.json")))["train_tokens"] >= float(TRAIN_TOKENS):
+    print("Копирую данные из входа:", os.path.dirname(found[0]))
+    shutil.copytree(os.path.dirname(found[0]), DATA, dirs_exist_ok=True)
+else:
+    !python tokenize_dataset.py --dataset openwebtext --train_tokens {TRAIN_TOKENS} --val_tokens 1e7 --out {DATA}
+print(open(f"{DATA}/meta.json").read())
+
+prev = sorted(glob.glob(f"/kaggle/input/**/runs/{NAME}/plan.json", recursive=True))
+if prev and not os.path.exists(f"{OUT}/plan.json"):
+    print("Продолжаю прошлый запуск:", os.path.dirname(prev[0]))
+    shutil.copytree(os.path.dirname(prev[0]), OUT, dirs_exist_ok=True)
+else:
+    print("Новый запуск" if not prev else "Прошлый запуск уже скопирован")
+```
+
+### Ячейка 3 — обучение
+
+```python
+HOURS = f"{SESSION_HOURS - (time.time() - T0) / 3600 - 0.3:.2f}"
+print("Часов на обучение:", HOURS)
+!python ngpt_vs_gpt.py run --data {DATA} --out {OUT} {PLAN} --hours {HOURS}
+```
+
+### Ячейка 4 — отчёт и PDF
+
+```python
+!python ngpt_vs_gpt.py report --out {OUT} > /dev/null
+!python make_pdf_report.py {OUT}/report --out /kaggle/working/{NAME}.pdf
+from IPython.display import Markdown, display
+display(Markdown(open(f"{OUT}/report/report.md", encoding="utf-8").read()))
+```
+
+Сохрани (**Ctrl+S**). Вручную ячейки не запускай.
+
+---
+
+## 2. Сессия 1
+
+1. Проверь: **GPU T4 x2**, **Internet On**, **Input пустой**.
+2. **Save Version → Save & Run All (Commit) → Save**, затем выключи интерактивную сессию **⏻**.
+   Браузер можно закрыть.
+3. Через ~1 час: **Your Work → `ngpt-ladder-c` → Logs**. Должно быть:
+   ```
+   torch ... | GPU: ['Tesla T4', 'Tesla T4']        ← обязательно две
+   PLAN: ... --jobs gpt:1.4B:3e-3,gpt:1.4B:2e-3,ngpt:775M:2e-3,gpt:775M:4.2e-3,gpt:450M:3e-3 ...
+   Новый запуск
+   План: 5 прогонов, устройства ['0', '1'], лимит ... ч
+   [0] ...: старт (...)
+   [1] ...: старт (...)
+   ```
+   Если «ОШИБКА» — пришли весь текст ошибки в чат.
+4. Через ~11.5 ч сессия закончится. В конце лога примерно так (это **нормально**):
+   ```
+[.] gpt_1.4B_lr0.003: готово (или пауза)
+[.] gpt_1.4B_lr0.002: готово (или пауза)
+   Не закончено: ... прогонов. Запустите ту же команду ещё раз, чтобы продолжить.
+   ```
+
+## 3. Сессия 2 — сразу после первой
+
+1. Открой `ngpt-ladder-c` → **Edit**.
+2. Справа **Add Input → Your Work → `ngpt-ladder-c` → Add** (это вывод первой сессии: данные и сохранённое обучение).
+3. В ячейках **ничего не меняй**. GPU T4 x2, Internet On.
+4. **Save Version → Save & Run All (Commit) → Save**, выключи **⏻**.
+5. Через ~10 минут в Logs должно быть:
+   ```
+   Копирую данные из входа: /kaggle/input/...
+   Продолжаю прошлый запуск: /kaggle/input/.../runs/ladder_C
+   [0] ...: продолжаю (...)
+   ```
+6. В конце второй сессии:
+   ```
+[.] ngpt_775M_lr0.002: готово, val loss ...
+[.] gpt_775M_lr0.0042: готово, val loss ...
+[.] gpt_450M_lr0.003: готово, val loss ...
+   Все прогоны закончены.
+   ```
+   Если вместо «Все прогоны закончены» снова «Не закончено» — запусти **третью сессию** так же, как вторую
+   (во Input убери старую версию и добавь `ngpt-ladder-c` заново — подтянется последняя).
+
+## 4. Сдать результат
+
+1. **Share → Add collaborators → `vladimir337` → Can view** (нужно для общего отчёта).
+2. Пришли в чат все строки `готово, val loss ...` из конца лога последней сессии.
+
+---
+
+## Коротко
+
+| Шаг | Что делаешь | Время |
+|---|---|---|
+| 1 | Ноутбук `ngpt-ladder-c`, 4 ячейки, GPU T4 x2, Internet On, Input пустой | 5 мин |
+| 2 | Сессия 1: Save & Run All, ⏻, через час проверить Logs | ~11.5 ч |
+| 3 | Сессия 2: Add Input = `ngpt-ladder-c`, Save & Run All, ⏻ | ~11.5 ч |
+| 4 | Share `vladimir337`, прислать строки «готово, val loss» | 2 мин |

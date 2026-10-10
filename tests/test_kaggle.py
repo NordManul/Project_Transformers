@@ -272,3 +272,60 @@ def test_accounts_split_balanced():
     assert names[1] == ["ngpt_150M_lr0.00075", "ngpt_150M_lr0.0015"]
     assert names[3] == ["gpt_150M_lr0.00075", "ngpt_150M_lr0.003", "gpt_150M_lr0.0015"]
     assert names[4] == ["gpt_150M_lr0.003", "gpt_150M_lr0.006", "gpt_150M_lr0.012"]
+
+
+def test_explicit_jobs_ladder():
+    """--jobs: свой бюджет и lr у каждого прогона, длинные первыми (лестница бюджетов за одну сессию)."""
+    plan = dict(exp.DEFAULT_PLAN, n_layer=6, n_head=6, d_model=384,
+                jobs="ngpt:300M:4.5e-3, gpt:1.4B:3e-3, ngpt:450M:3.8e-3")
+    jobs = exp.make_jobs(plan)
+    assert [j["name"] for j in jobs] == ["gpt_1.4B_lr0.003", "ngpt_450M_lr0.0038", "ngpt_300M_lr0.0045"]
+    assert jobs[0]["steps"] == round(1.4e9 / 65536) and all(j["lr"] for j in jobs)
+    with pytest.raises(ValueError):
+        exp.make_jobs(dict(plan, jobs="bert:1B:1e-3"))
+
+
+def _fake_ctx(root, name, ctx):
+    cfg_path = root / "runs" / name / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["args"]["block_size"] = ctx
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+
+def test_report_budget_ladder_both_directions(tmp_path):
+    """Лестница бюджетов: на каждом бюджете лучший lr (среднее по сидам), ускорение в обе стороны,
+    прогоны с другим контекстом не смешиваются."""
+    root = tmp_path / "all"
+
+    def run(name, model, lr, seed, final, max_iters):
+        _fake_run(root, name, model, lr, seed, final, [final + 0.5, final + 0.1, final])
+        cfg_path = root / "runs" / name / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["args"]["max_iters"] = max_iters      # 100 токенов на шаг
+        cfg["args"]["block_size"] = 1024
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    run("gpt_1K_lr0.003", "gpt", 3e-3, 42, 3.74, 10)
+    run("gpt_1K_lr0.006", "gpt", 6e-3, 42, 3.78, 10)
+    run("ngpt_1K_lr0.006", "ngpt", 6e-3, 42, 3.60, 10)
+    run("ngpt_2K_lr0.0045", "ngpt", 4.5e-3, 42, 3.44, 20)
+    run("ngpt_3K_lr0.0038", "ngpt", 3.8e-3, 42, 3.37, 30)
+    run("gpt_5K_lr0.003", "gpt", 3e-3, 42, 3.36, 50)
+    run("gpt_5K_lr0.003_s43", "gpt", 3e-3, 43, 3.38, 50)
+    run("ngpt_5K_lr0.003", "ngpt", 3e-3, 42, 3.25, 50)
+    run("gpt_10K_lr0.003", "gpt", 3e-3, 42, 3.22, 100)
+    run("gpt_5K_lr0.003_s44", "gpt", 3e-3, 44, 3.10, 50)
+    _fake_ctx(root, "gpt_5K_lr0.003_s44", 2048)      # другой контекст — в отчёт не попадает
+    exp.report(root, quiet=True)
+    text = (root / "report" / "report.md").read_text(encoding="utf-8")
+    summary = json.loads((root / "report" / "summary.json").read_text())
+    assert "пропущены: gpt_5K_lr0.003_s44" in text
+    assert summary["final"]["gpt"] == [[1000, 3.74], [5000, pytest.approx(3.37)], [10000, 3.22]]
+    assert [t for t, _ in summary["final"]["ngpt"]] == [1000, 2000, 3000, 5000]
+    # GPT на 5K (3.37 в среднее по 2 сидам) — nGPT дошёл до этого на 3K -> ускорение 5/3
+    rev = {d["tokens"]: d for d in summary["speedups_reverse"]}
+    assert rev[5000]["sign"] == "=" and rev[5000]["ratio"] == pytest.approx(5000 / 3000)
+    # nGPT на 5K (3.25): GPT — между 5K и 10K
+    fwd = {d["tokens"]: d for d in summary["speedups"]}
+    assert fwd[5000]["sign"] == "=" and 1.0 < fwd[5000]["ratio"] < 2.0
+    assert summary["best_lr"] == {"gpt": 0.003, "ngpt": 0.003}
